@@ -88,7 +88,7 @@ static NSString *const headerWSAcceptName      = @"Sec-WebSocket-Accept";
 
 //Class Constants
 static char CRLFBytes[] = {'\r', '\n', '\r', '\n'};
-static int BUFFER_MAX = 4096;
+#define BUFFER_MAX 4096
 
 // This get the correct bits out by masking the bytes of the buffer.
 static const uint8_t JFRFinMask             = 0x80;
