@@ -97,30 +97,21 @@ static const uint8_t JFRMaskMask            = 0x80;
 static const uint8_t JFRPayloadLenMask      = 0x7F;
 static const size_t  JFRMaxFrameSize        = 32;
 
-@interface JFRWebSocketProxyHandler : NSObject <NSStreamDelegate, UIAlertViewDelegate>
-@property(atomic, strong)NSString *proxyUsername;
-@property(atomic, strong)NSString *proxyPassword;
+@interface JFRWebSocketProxyHandler : NSObject <NSStreamDelegate>
+@property(nonatomic, strong)NSString *proxyUsername;
+@property(nonatomic, strong)NSString *proxyPassword;
 @property(nonatomic, strong)NSURL *url;
 @property(nonatomic, strong)NSURL *proxy;
 @property(nonatomic, strong)NSInputStream *inputStream;
 @property(nonatomic, strong)NSOutputStream *outputStream;
-@property(nonatomic, strong)NSCondition *proxyAuthCondition;
 @property(nonatomic, strong)NSTimer *timeout;
 @property(nonatomic, strong)NSMutableData *response;
 @property(nonatomic, copy)void (^completion)(bool success, NSInputStream *inputStream, NSOutputStream *outputStream, NSString *sni);
 @property(nonatomic, assign)bool connecting;
+@property(nonatomic, assign)NSUInteger authTries;
 @end
 
 @implementation JFRWebSocketProxyHandler
-
-- (id)init
-{
-    if(!(self = [super init]))
-        return nil;
-    
-    self.proxyAuthCondition = [NSCondition new];
-    return self;
-}
 
 - (NSURL*)wsToHTTP:(NSURL*)url
 {
@@ -133,38 +124,6 @@ static const size_t  JFRMaxFrameSize        = 32;
     }
     
     return components.URL;
-}
-
-- (void)alertView:(UIAlertView *)alertView didDismissWithButtonIndex:(NSInteger)buttonIndex
-{
-    self.proxyUsername = [alertView textFieldAtIndex:0].text;
-    self.proxyPassword = [alertView textFieldAtIndex:1].text;
-    self.proxyUsername = (self.proxyUsername ? self.proxyUsername :  @"");
-    self.proxyPassword = (self.proxyPassword ? self.proxyPassword :  @"");
-    [self.proxyAuthCondition signal];
-}
-
-- (void)promptForPassword
-{
-    __weak id weakSelf = self;
-    dispatch_sync(dispatch_get_main_queue(), ^{
-        UIAlertView *alert = [[UIAlertView alloc] initWithTitle:@"Proxy authentication"
-                                                        message:[NSString stringWithFormat:@"Enter username and password:"]
-                                                       delegate:self cancelButtonTitle:@"Ok"
-                                              otherButtonTitles:nil];
-        [alert setAlertViewStyle:UIAlertViewStyleLoginAndPasswordInput];
-        [alert textFieldAtIndex:0].text = self.proxyUsername;
-        [alert textFieldAtIndex:1].text = self.proxyPassword;
-        [alert show];
-        alert.delegate = weakSelf;
-    });
-    
-
-    [self.timeout invalidate];
-    [self.proxyAuthCondition lock];
-    [self.proxyAuthCondition wait];
-    [self.proxyAuthCondition unlock];
-    [self resetTimeout];
 }
 
 - (void)complete:(bool)success sni:(NSString*)sni
@@ -240,6 +199,7 @@ static const size_t  JFRMaxFrameSize        = 32;
     }
     
     NSDictionary *proxyHeaders = (__bridge id)CFHTTPMessageCopyAllHeaderFields(receivedProxyHTTPHeaders);
+
     NSInteger responseCode = CFHTTPMessageGetResponseStatusCode(receivedProxyHTTPHeaders);
     CFRelease(receivedProxyHTTPHeaders);
     
@@ -249,7 +209,12 @@ static const size_t  JFRMaxFrameSize        = 32;
     self.response = nil;
     
     if(responseCode == 407) {
-        [self promptForPassword];
+        if (self.authTries >= 3) {
+            [self complete:false sni:nil];
+            return;
+        }
+        
+        self.authTries++;
         
         NSString *authHeader = proxyHeaders[@"Proxy-Authenticate"];
         NSString *auth = nil;
@@ -258,7 +223,9 @@ static const size_t  JFRMaxFrameSize        = 32;
             authType = @"Digest";
         } else {
             authType = @"Basic";
-            auth = [[[NSString stringWithFormat:@"%@:%@", self.proxyUsername, self.proxyPassword] dataUsingEncoding:NSASCIIStringEncoding] base64EncodedStringWithOptions:0];
+            if (self.proxyUsername && self.proxyPassword) {
+                auth = [[[NSString stringWithFormat:@"%@:%@", self.proxyUsername, self.proxyPassword] dataUsingEncoding:NSASCIIStringEncoding] base64EncodedStringWithOptions:0];
+            }
         }
         
         if(auth) {
@@ -371,14 +338,21 @@ static const size_t  JFRMaxFrameSize        = 32;
     if(!self.proxy.host.length || !self.proxy.port)
         self.proxy = nil;
     
-    self.proxyUsername = [settings objectForKey:(__bridge id)kCFProxyUsernameKey];
-    self.proxyPassword = [settings objectForKey:(__bridge id)kCFProxyPasswordKey];
-    
-    if(!self.proxyUsername)
-        self.proxyUsername = [proxySettings objectForKey:@"HTTPProxyUsername"];
-    
-    if(!self.proxyPassword)
-        self.proxyPassword = [proxySettings objectForKey:@"HTTPProxyPassword"];
+    if (!self.proxyUsername) {
+        self.proxyUsername = [settings objectForKey:(__bridge id)kCFProxyUsernameKey];
+        
+        if(!self.proxyUsername)
+            self.proxyUsername = [proxySettings objectForKey:@"HTTPProxyUsername"];
+        
+    }
+
+    if (!self.proxyPassword) {
+        self.proxyPassword = [settings objectForKey:(__bridge id)kCFProxyPasswordKey];
+        
+        
+        if(!self.proxyPassword)
+            self.proxyPassword = [proxySettings objectForKey:@"HTTPProxyPassword"];
+    }
     
     CFReadStreamRef readStream = NULL;
     CFWriteStreamRef writeStream = NULL;
@@ -391,6 +365,7 @@ static const size_t  JFRMaxFrameSize        = 32;
     
     self.response = nil;
     self.connecting = false;
+    self.authTries = 0;
     [self resetTimeout];
     self.inputStream = (__bridge_transfer NSInputStream *)readStream;
     self.outputStream = (__bridge_transfer NSOutputStream *)writeStream;
@@ -554,6 +529,8 @@ static const size_t  JFRMaxFrameSize        = 32;
     CFRelease(urlRequest);
     
     JFRWebSocketProxyHandler *proxyHandler = [JFRWebSocketProxyHandler new];
+    proxyHandler.proxyUsername = self.proxyUsername;
+    proxyHandler.proxyPassword = self.proxyPassword;
     
     __weak JFRWebSocket *weakSelf = self;
     [proxyHandler connect:self.url completion:^(bool success, NSInputStream *inputStream, NSOutputStream *outputStream, NSString *sni){

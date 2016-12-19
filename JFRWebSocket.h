@@ -130,6 +130,16 @@
 @property(nonatomic, strong)JFRSecurity *security;
 
 /**
+ Username for HTTP proxy.
+ */
+@property(nonatomic, strong)NSString *proxyUsername;
+
+/**
+ Password for HTTP proxy.
+ */
+@property(nonatomic, strong)NSString *proxyPassword;
+
+/**
  Set your own custom queue.
  Default setting is dispatch_get_main_queue.
  */
