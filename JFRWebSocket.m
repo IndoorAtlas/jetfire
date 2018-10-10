@@ -1024,7 +1024,12 @@ static const size_t  JFRMaxFrameSize        = 32;
         if(isMask) {
             buffer[1] |= JFRMaskMask;
             uint8_t *mask_key = (buffer + offset);
-            SecRandomCopyBytes(kSecRandomDefault, sizeof(uint32_t), (uint8_t *)mask_key);
+            if (SecRandomCopyBytes(kSecRandomDefault, sizeof(uint32_t), (uint8_t *)mask_key) != errSecSuccess) {
+                NSError *error = [strongSelf errorWithDetail:@"SecRandomCopyBytes failed" code:JFROutputStreamWriteError];
+                [strongSelf doDisconnect:error];
+                return;
+            }
+        
             offset += sizeof(uint32_t);
             
             for (size_t i = 0; i < dataLength; i++) {
