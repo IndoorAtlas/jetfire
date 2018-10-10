@@ -60,7 +60,7 @@ typedef NS_ENUM(NSUInteger, JFRInternalErrorCode) {
 @property(nonatomic, strong)NSInputStream *inputStream;
 @property(nonatomic, strong)NSOutputStream *outputStream;
 @property(nonatomic, strong)NSOperationQueue *writeQueue;
-@property(nonatomic, assign)BOOL isRunLoop;
+@property(atomic, assign)BOOL isRunLoop;
 @property(nonatomic, strong)NSMutableArray *readStack;
 @property(nonatomic, strong)NSMutableArray *inputQueue;
 @property(nonatomic, strong)NSData *fragBuffer;
@@ -69,6 +69,7 @@ typedef NS_ENUM(NSUInteger, JFRInternalErrorCode) {
 @property(nonatomic, assign)BOOL isCreated;
 @property(nonatomic, assign)BOOL didDisconnect;
 @property(nonatomic, assign)BOOL certValidated;
+@property(nonatomic, strong)dispatch_queue_t bqueue;
 
 @end
 
@@ -390,6 +391,7 @@ static const size_t  JFRMaxFrameSize        = 32;
         self.voipEnabled = NO;
         self.selfSignedSSL = NO;
         self.queue = dispatch_get_main_queue();
+        self.bqueue = dispatch_queue_create("JFRWebSucket", DISPATCH_QUEUE_SERIAL);
         self.url = url;
         self.readStack = [NSMutableArray new];
         self.inputQueue = [NSMutableArray new];
@@ -411,7 +413,7 @@ static const size_t  JFRMaxFrameSize        = 32;
     });
 
     //everything is on a background thread.
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+    dispatch_async(self.bqueue, ^{
         weakSelf.isCreated = YES;
         [weakSelf createHTTPRequest];
         weakSelf.isCreated = NO;
@@ -420,6 +422,7 @@ static const size_t  JFRMaxFrameSize        = 32;
 /////////////////////////////////////////////////////////////////////////////
 - (void)disconnect {
     [self writeError:JFRCloseCodeNormal];
+    self.isRunLoop = false;
 }
 /////////////////////////////////////////////////////////////////////////////
 - (void)writeString:(NSString*)string {
@@ -546,7 +549,7 @@ static const size_t  JFRMaxFrameSize        = 32;
     
     self.isRunLoop = YES;
     while (self.isRunLoop) {
-        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate distantFuture]];
+        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:5]];
     }
 }
 /////////////////////////////////////////////////////////////////////////////
@@ -742,7 +745,7 @@ static const size_t  JFRMaxFrameSize        = 32;
             _isConnected = YES;
             __weak typeof(self) weakSelf = self;
             dispatch_async(self.queue,^{
-                if([self.delegate respondsToSelector:@selector(websocketDidConnect:)]) {
+                if([weakSelf.delegate respondsToSelector:@selector(websocketDidConnect:)]) {
                     [weakSelf.delegate websocketDidConnect:self];
                 }
                 if(weakSelf.onConnect) {
