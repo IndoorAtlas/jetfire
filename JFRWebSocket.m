@@ -422,7 +422,7 @@ static const size_t  JFRMaxFrameSize        = 32;
 /////////////////////////////////////////////////////////////////////////////
 - (void)disconnect {
     [self writeError:JFRCloseCodeNormal];
-    self.isRunLoop = false;
+    self.isRunLoop = NO;
 }
 /////////////////////////////////////////////////////////////////////////////
 - (void)writeString:(NSString*)string {
@@ -549,7 +549,7 @@ static const size_t  JFRMaxFrameSize        = 32;
     
     self.isRunLoop = YES;
     while (self.isRunLoop) {
-        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:5]];
+        [[NSRunLoop currentRunLoop] runMode:NSRunLoopCommonModes beforeDate:[NSDate dateWithTimeIntervalSinceNow:5]];
     }
 }
 /////////////////////////////////////////////////////////////////////////////
