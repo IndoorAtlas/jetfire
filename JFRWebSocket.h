@@ -49,8 +49,19 @@
 -(void)websocket:(JFRWebSocket*)socket didReceivePong:(NSData*)data;
 @end
 
-@interface JFRWebSocket : NSObject
+@class JFRWebSocket;
+@interface JFRWebSucket : NSObject
+// These need to be exposed for the unit tests :(
+- (instancetype)initWithURL:(NSURL *)url protocols:(NSArray*)protocols;
+@property(atomic, weak)JFRWebSocket *master;
+@property(atomic, weak)id<JFRWebSocketDelegate>delegate;
+@property(atomic, readonly) NSURL *url;
+@end
 
+@interface JFRWebSocket : NSObject
+@end
+
+@interface JFRWebSocket (ForwardedMethods)
 @property(nonatomic,weak)id<JFRWebSocketDelegate>delegate;
 @property(nonatomic, readonly) NSURL *url;
 
@@ -120,7 +131,7 @@
  If left nil (unset) kCFStreamSo cketSecurityLevelNegotiatedSSL is used.
  
  NOTE: On iOS7 (and 8?) kCFStreamSocketSecurityLevelNegotiatedSSL will fail for servers that negotiate SSL level lower than TLSv1
-       Thus it's wise to set this to kCFStreamSocketSecurityLevelTLSv1 in most cases.
+ Thus it's wise to set this to kCFStreamSocketSecurityLevelTLSv1 in most cases.
  */
 @property(nonatomic, strong)NSString *securityLevel;
 
@@ -164,5 +175,4 @@
  Block property to use on receiving text.
  */
 @property(nonatomic, strong)void (^onText)(NSString*);
-
 @end

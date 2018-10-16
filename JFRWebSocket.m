@@ -9,6 +9,8 @@
 
 #import "JFRWebSocket.h"
 #import <UIKit/UIKit.h>
+#import <pthread.h>
+#import <objc/runtime.h>
 
 //get the opCode from the packet
 typedef NS_ENUM(NSUInteger, JFROpCode) {
@@ -54,13 +56,31 @@ typedef NS_ENUM(NSUInteger, JFRInternalErrorCode) {
 
 @end
 
-@interface JFRWebSocket ()<NSStreamDelegate>
+@class JFRWebSocketProxyHandler;
+@interface JFRWebSucket () <NSStreamDelegate>
+- (void)connect;
+- (void)disconnect;
+- (void)writeData:(NSData*)data;
+- (void)writeString:(NSString*)string;
+- (void)writePing:(NSData*)data;
+- (void)addHeader:(NSString*)value forKey:(NSString*)key;
 
-@property(nonatomic, strong)NSURL *url;
+@property(atomic, assign)BOOL isConnected;
+@property(atomic, assign)BOOL voipEnabled;
+@property(atomic, assign)BOOL selfSignedSSL;
+@property(atomic, strong)NSString *securityLevel;
+@property(atomic, strong)JFRSecurity *security;
+@property(atomic, strong)NSString *proxyUsername;
+@property(atomic, strong)NSString *proxyPassword;
+@property(atomic, strong)dispatch_queue_t queue;
+@property(atomic, strong)void (^onConnect)(void);
+@property(atomic, strong)void (^onDisconnect)(NSError*);
+@property(atomic, strong)void (^onData)(NSData*);
+@property(atomic, strong)void (^onText)(NSString*);
+@property(atomic, strong)NSURL *url;
+
 @property(nonatomic, strong)NSInputStream *inputStream;
 @property(nonatomic, strong)NSOutputStream *outputStream;
-@property(nonatomic, strong)NSOperationQueue *writeQueue;
-@property(atomic, assign)BOOL isRunLoop;
 @property(nonatomic, strong)NSMutableArray *readStack;
 @property(nonatomic, strong)NSMutableArray *inputQueue;
 @property(nonatomic, strong)NSData *fragBuffer;
@@ -69,8 +89,7 @@ typedef NS_ENUM(NSUInteger, JFRInternalErrorCode) {
 @property(nonatomic, assign)BOOL isCreated;
 @property(nonatomic, assign)BOOL didDisconnect;
 @property(nonatomic, assign)BOOL certValidated;
-@property(nonatomic, strong)dispatch_queue_t bqueue;
-
+@property(nonatomic, strong)JFRWebSocketProxyHandler *proxyHandler;
 @end
 
 //Constant Header Values.
@@ -380,7 +399,7 @@ static const size_t  JFRMaxFrameSize        = 32;
 
 @end
 
-@implementation JFRWebSocket
+@implementation JFRWebSucket
 
 /////////////////////////////////////////////////////////////////////////////
 //Default initializer
@@ -391,7 +410,6 @@ static const size_t  JFRMaxFrameSize        = 32;
         self.voipEnabled = NO;
         self.selfSignedSSL = NO;
         self.queue = dispatch_get_main_queue();
-        self.bqueue = dispatch_queue_create("JFRWebSucket", DISPATCH_QUEUE_SERIAL);
         self.url = url;
         self.readStack = [NSMutableArray new];
         self.inputQueue = [NSMutableArray new];
@@ -407,22 +425,20 @@ static const size_t  JFRMaxFrameSize        = 32;
         return;
     }
     
-    __weak typeof(self) weakSelf = self;
-    dispatch_async(self.queue, ^{
-        weakSelf.didDisconnect = NO;
-    });
-
-    //everything is on a background thread.
-    dispatch_async(self.bqueue, ^{
-        weakSelf.isCreated = YES;
-        [weakSelf createHTTPRequest];
-        weakSelf.isCreated = NO;
-    });
+    self.didDisconnect = NO;
+    self.isCreated = YES;
+    [self createHTTPRequest];
+}
+- (void)dealloc {
+    [self disconnect];
 }
 /////////////////////////////////////////////////////////////////////////////
 - (void)disconnect {
+    if (self.didDisconnect)
+        return;
+    
+    self.didDisconnect = YES;
     [self writeError:JFRCloseCodeNormal];
-    self.isRunLoop = false;
 }
 /////////////////////////////////////////////////////////////////////////////
 - (void)writeString:(NSString*)string {
@@ -531,26 +547,21 @@ static const size_t  JFRMaxFrameSize        = 32;
     NSData *serializedRequest = (__bridge_transfer NSData *)(CFHTTPMessageCopySerializedMessage(urlRequest));
     CFRelease(urlRequest);
     
-    JFRWebSocketProxyHandler *proxyHandler = [JFRWebSocketProxyHandler new];
-    proxyHandler.proxyUsername = self.proxyUsername;
-    proxyHandler.proxyPassword = self.proxyPassword;
+    self.proxyHandler = [JFRWebSocketProxyHandler new];
+    self.proxyHandler.proxyUsername = self.proxyUsername;
+    self.proxyHandler.proxyPassword = self.proxyPassword;
     
-    __weak JFRWebSocket *weakSelf = self;
-    [proxyHandler connect:self.url completion:^(bool success, NSInputStream *inputStream, NSOutputStream *outputStream, NSString *sni){
+    __weak typeof(self) weakSelf = self;
+    [self.proxyHandler connect:self.url completion:^(bool success, NSInputStream *inputStream, NSOutputStream *outputStream, NSString *sni){
         weakSelf.inputStream = inputStream;
         weakSelf.outputStream = outputStream;
         
         if(success) {
             [weakSelf initStreamsWithData:serializedRequest withSNI:sni];
         } else {
-            [weakSelf doDisconnect:[self errorWithDetail:@"proxy authentication failed" code:JFRProxyError]];
+            [weakSelf doDisconnect:[weakSelf errorWithDetail:@"proxy authentication failed" code:JFRProxyError]];
         }
     }];
-    
-    self.isRunLoop = YES;
-    while (self.isRunLoop) {
-        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:5]];
-    }
 }
 /////////////////////////////////////////////////////////////////////////////
 //Random String of 16 lowercase chars, SHA1 and base64 encoded.
@@ -658,14 +669,12 @@ static const size_t  JFRMaxFrameSize        = 32;
 }
 /////////////////////////////////////////////////////////////////////////////
 - (void)disconnectStream:(NSError*)error {
-    [self.writeQueue waitUntilAllOperationsAreFinished];
     [self.inputStream removeFromRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
     [self.outputStream removeFromRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
     [self.outputStream close];
     [self.inputStream close];
     self.outputStream = nil;
     self.inputStream = nil;
-    self.isRunLoop = NO;
     _isConnected = NO;
     self.certValidated = NO;
     [self doDisconnect:error];
@@ -746,7 +755,7 @@ static const size_t  JFRMaxFrameSize        = 32;
             __weak typeof(self) weakSelf = self;
             dispatch_async(self.queue,^{
                 if([weakSelf.delegate respondsToSelector:@selector(websocketDidConnect:)]) {
-                    [weakSelf.delegate websocketDidConnect:self];
+                    [weakSelf.delegate websocketDidConnect:weakSelf.master];
                 }
                 if(weakSelf.onConnect) {
                     weakSelf.onConnect();
@@ -893,7 +902,7 @@ static const size_t  JFRMaxFrameSize        = 32;
             __weak typeof(self) weakSelf = self;
             dispatch_async(self.queue,^{
                 if([weakSelf.delegate respondsToSelector:@selector(websocket:didReceivePong:)]) {
-                    [weakSelf.delegate websocket:weakSelf didReceivePong:data];
+                    [weakSelf.delegate websocket:weakSelf.master didReceivePong:data];
                 }
             });
             return;
@@ -968,7 +977,7 @@ static const size_t  JFRMaxFrameSize        = 32;
             __weak typeof(self) weakSelf = self;
             dispatch_async(self.queue,^{
                 if([weakSelf.delegate respondsToSelector:@selector(websocket:didReceiveMessage:)]) {
-                    [weakSelf.delegate websocket:weakSelf didReceiveMessage:str];
+                    [weakSelf.delegate websocket:weakSelf.master didReceiveMessage:str];
                 }
                 if(weakSelf.onText) {
                     weakSelf.onText(str);
@@ -978,7 +987,7 @@ static const size_t  JFRMaxFrameSize        = 32;
             __weak typeof(self) weakSelf = self;
             dispatch_async(self.queue,^{
                 if([weakSelf.delegate respondsToSelector:@selector(websocket:didReceiveData:)]) {
-                    [weakSelf.delegate websocket:weakSelf didReceiveData:data];
+                    [weakSelf.delegate websocket:weakSelf.master didReceiveData:data];
                 }
                 if(weakSelf.onData) {
                     weakSelf.onData(data);
@@ -995,87 +1004,75 @@ static const size_t  JFRMaxFrameSize        = 32;
     if(!self.isConnected) {
         return;
     }
-    if(!self.writeQueue) {
-        self.writeQueue = [[NSOperationQueue alloc] init];
-        self.writeQueue.maxConcurrentOperationCount = 1;
+
+    uint64_t offset = 2; //how many bytes do we need to skip for the header
+    uint8_t *bytes = (uint8_t*)[data bytes];
+    uint64_t dataLength = data.length;
+    NSMutableData *frame = [[NSMutableData alloc] initWithLength:(NSInteger)(dataLength + JFRMaxFrameSize)];
+    uint8_t *buffer = (uint8_t*)[frame mutableBytes];
+    buffer[0] = JFRFinMask | code;
+    if(dataLength < 126) {
+        buffer[1] |= dataLength;
+    } else if(dataLength <= UINT16_MAX) {
+        buffer[1] |= 126;
+        *((uint16_t *)(buffer + offset)) = CFSwapInt16BigToHost((uint16_t)dataLength);
+        offset += sizeof(uint16_t);
+    } else {
+        buffer[1] |= 127;
+        *((uint64_t *)(buffer + offset)) = CFSwapInt64BigToHost((uint64_t)dataLength);
+        offset += sizeof(uint64_t);
     }
-    
-    __weak typeof(self) weakSelf = self;
-    [self.writeQueue addOperationWithBlock:^{
-        if(!weakSelf || !weakSelf.isConnected) {
+    BOOL isMask = YES;
+    if(isMask) {
+        buffer[1] |= JFRMaskMask;
+        uint8_t *mask_key = (buffer + offset);
+        if (SecRandomCopyBytes(kSecRandomDefault, sizeof(uint32_t), (uint8_t *)mask_key) != errSecSuccess) {
+            NSError *error = [self errorWithDetail:@"SecRandomCopyBytes failed" code:JFROutputStreamWriteError];
+            [self doDisconnect:error];
             return;
         }
-        typeof(weakSelf) strongSelf = weakSelf;
-        uint64_t offset = 2; //how many bytes do we need to skip for the header
-        uint8_t *bytes = (uint8_t*)[data bytes];
-        uint64_t dataLength = data.length;
-        NSMutableData *frame = [[NSMutableData alloc] initWithLength:(NSInteger)(dataLength + JFRMaxFrameSize)];
-        uint8_t *buffer = (uint8_t*)[frame mutableBytes];
-        buffer[0] = JFRFinMask | code;
-        if(dataLength < 126) {
-            buffer[1] |= dataLength;
-        } else if(dataLength <= UINT16_MAX) {
-            buffer[1] |= 126;
-            *((uint16_t *)(buffer + offset)) = CFSwapInt16BigToHost((uint16_t)dataLength);
-            offset += sizeof(uint16_t);
-        } else {
-            buffer[1] |= 127;
-            *((uint64_t *)(buffer + offset)) = CFSwapInt64BigToHost((uint64_t)dataLength);
-            offset += sizeof(uint64_t);
-        }
-        BOOL isMask = YES;
-        if(isMask) {
-            buffer[1] |= JFRMaskMask;
-            uint8_t *mask_key = (buffer + offset);
-            if (SecRandomCopyBytes(kSecRandomDefault, sizeof(uint32_t), (uint8_t *)mask_key) != errSecSuccess) {
-                NSError *error = [strongSelf errorWithDetail:@"SecRandomCopyBytes failed" code:JFROutputStreamWriteError];
-                [strongSelf doDisconnect:error];
-                return;
-            }
         
-            offset += sizeof(uint32_t);
-            
-            for (size_t i = 0; i < dataLength; i++) {
-                buffer[offset] = bytes[i] ^ mask_key[i % sizeof(uint32_t)];
-                offset += 1;
+        offset += sizeof(uint32_t);
+        
+        for (size_t i = 0; i < dataLength; i++) {
+            buffer[offset] = bytes[i] ^ mask_key[i % sizeof(uint32_t)];
+            offset += 1;
+        }
+    } else {
+        for(size_t i = 0; i < dataLength; i++) {
+            buffer[offset] = bytes[i];
+            offset += 1;
+        }
+    }
+    uint64_t total = 0;
+    while (true) {
+        if(!self.isConnected || !self.outputStream) {
+            break;
+        }
+        NSInteger len = [self.outputStream write:([frame bytes]+total) maxLength:(NSInteger)(offset-total)];
+        if(len < 0 || len == NSNotFound) {
+            NSError *error = self.outputStream.streamError;
+            if(!error) {
+                error = [self errorWithDetail:@"output stream error during write" code:JFROutputStreamWriteError];
             }
+            [self doDisconnect:error];
+            break;
         } else {
-            for(size_t i = 0; i < dataLength; i++) {
-                buffer[offset] = bytes[i];
-                offset += 1;
-            }
+            total += len;
         }
-        uint64_t total = 0;
-        while (true) {
-            if(!strongSelf.isConnected || !strongSelf.outputStream) {
-                break;
-            }
-            NSInteger len = [strongSelf.outputStream write:([frame bytes]+total) maxLength:(NSInteger)(offset-total)];
-            if(len < 0 || len == NSNotFound) {
-                NSError *error = strongSelf.outputStream.streamError;
-                if(!error) {
-                    error = [strongSelf errorWithDetail:@"output stream error during write" code:JFROutputStreamWriteError];
-                }
-                [strongSelf doDisconnect:error];
-                break;
-            } else {
-                total += len;
-            }
-            if(total >= offset) {
-                break;
-            }
+        if(total >= offset) {
+            break;
         }
-    }];
+    }
 }
 /////////////////////////////////////////////////////////////////////////////
 - (void)doDisconnect:(NSError*)error {
     if(!self.didDisconnect) {
+        [self disconnect];
         __weak typeof(self) weakSelf = self;
-        dispatch_async(self.queue, ^{
-            weakSelf.didDisconnect = YES;
-            [weakSelf disconnect];
+        dispatch_async(self.queue, ^{   
             if([weakSelf.delegate respondsToSelector:@selector(websocketDidDisconnect:error:)]) {
-                [weakSelf.delegate websocketDidDisconnect:weakSelf error:error];
+                [weakSelf.delegate websocketDidDisconnect:weakSelf.master error:error];
             }
             if(weakSelf.onDisconnect) {
                 weakSelf.onDisconnect(error);
@@ -1111,3 +1108,137 @@ static const size_t  JFRMaxFrameSize        = 32;
 
 @end
 /////////////////////////////////////////////////////////////////////////////
+
+@interface JFRThread : NSObject
+@property (nonatomic, strong) NSThread *thread;
+@property (nonatomic, strong) NSCondition *startCondition;
+@property (nonatomic, strong) NSCondition *exitCondition;
+@end
+
+@implementation JFRThread
+- (id)init
+{
+    if (!(self = [super init]))
+        return nil;
+    
+    self.startCondition = [NSCondition new];
+    self.exitCondition = [NSCondition new];
+    self.thread = [[NSThread alloc] initWithTarget:self selector:@selector(mainOnThread) object:nil];
+    return self;
+}
+
+- (void)startWithName:(NSString*)name
+{
+    self.thread.name = name;
+    [self.startCondition lock];
+    [self.thread start];
+    [self.startCondition wait];
+    [self.startCondition unlock];
+}
+
+- (void)stop
+{
+    [self.exitCondition lock];
+    [self performSelector:@selector(stopOnThread) onThread:self.thread withObject:nil waitUntilDone:NO];
+    [self.exitCondition wait];
+    [self.exitCondition unlock];
+}
+
+- (void)stopOnThread
+{
+    CFRunLoopStop(CFRunLoopGetCurrent());
+}
+
+static void noop(void *info) {}
+
+- (void)mainOnThread
+{
+    @autoreleasepool {
+        pthread_setname_np([[[NSThread currentThread] name] UTF8String]);
+        CFRunLoopSourceContext context = {0};
+        context.perform = noop;
+        CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, 0, &context);
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
+        [self.startCondition lock];
+        [self.startCondition signal];
+        [self.startCondition unlock];
+        CFRunLoopRun();
+        CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
+        CFRelease(source);
+        [self.exitCondition lock];
+        [self.exitCondition signal];
+        [self.exitCondition unlock];
+    }
+}
+@end
+
+@interface JFRWebSocket () <NSStreamDelegate>
+{
+    objc_property_t *properties;
+    u_int property_count;
+}
+@property (nonatomic, strong) JFRWebSucket *sucket;
+@property (nonatomic, strong) JFRThread *thread;
+@end
+
+@implementation JFRWebSocket
+- (instancetype)initWithURL:(NSURL *)url protocols:(NSArray*)protocols
+{
+    if (!(self = [super init]))
+        return nil;
+    
+    self.sucket = [[JFRWebSucket alloc] initWithURL:url protocols:protocols];
+    self.sucket.master = self;
+    properties = class_copyPropertyList([self.sucket class], &property_count);
+    self.thread = [JFRThread new];
+    [self.thread startWithName:@"JFRWebSucket"];
+    return self;
+}
+
+- (void)dealloc
+{
+    [self.thread stop];
+    free(properties);
+}
+
+- (BOOL)respondsToSelector:(SEL)selector
+{
+    return [super respondsToSelector:selector] || [self.sucket respondsToSelector:selector];
+}
+
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector
+{
+    NSMethodSignature *sig;
+    if ((sig = [super methodSignatureForSelector:selector]))
+        return sig;
+    return [self.sucket methodSignatureForSelector:selector];
+}
+
+- (bool)isProperty:(SEL)selector
+{
+    for (int i = 0; i < property_count; ++i) {
+        char setter[255] = {0};
+        const char *propertyName = property_getName(properties[i]);
+        snprintf(setter, sizeof(setter), "set%s:", propertyName);
+        setter[3] = toupper(setter[3]);
+        if (!strcmp(sel_getName(selector), propertyName) || !strcmp(sel_getName(selector), setter))
+            return true;
+    }
+    return false;
+}
+
+- (void)forwardInvocation:(NSInvocation *)invocation
+{
+    if ([self.sucket respondsToSelector:invocation.selector]) {
+        if ([self isProperty:invocation.selector]) {
+            [invocation invokeWithTarget:self.sucket];
+        } else {
+            [invocation retainArguments];
+            [invocation performSelector:@selector(invokeWithTarget:) onThread:self.thread.thread withObject:self.sucket waitUntilDone:NO];
+        }
+    } else {
+        [self doesNotRecognizeSelector:invocation.selector];
+    }
+}
+
+@end
